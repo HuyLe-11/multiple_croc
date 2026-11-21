@@ -32,6 +32,7 @@ type relayControlResult struct {
 	banner     string
 	externalIP string
 	capability string
+	meta       tcp.RelayMeta
 }
 
 type receiverRelayAttempt struct {
@@ -119,7 +120,7 @@ func (c *Client) connectRelayControlContext(ctx context.Context, addresses ...st
 		return relayControlResult{}, err
 	}
 	stopClose := context.AfterFunc(ctx, connection.Close)
-	banner, externalIP, capability, err := tcp.HandshakeTCPServerCapability(connection, c.Options.RelayPassword, c.Options.RoomName)
+	banner, externalIP, capability, meta, err := tcp.HandshakeTCPServerMeta(connection, c.Options.RelayPassword, c.Options.RoomName)
 	closeStopped := stopClose()
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		connection.Close()
@@ -139,6 +140,7 @@ func (c *Client) connectRelayControlContext(ctx context.Context, addresses ...st
 		banner:     banner,
 		externalIP: externalIP,
 		capability: capability,
+		meta:       meta,
 	}, nil
 }
 

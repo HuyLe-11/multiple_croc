@@ -41,3 +41,5 @@ tmp/
 /src/webassets/dist/*
 !/src/webassets/dist/.gitkeep
 croc2
+test/simulation/docker/shared/
+test/practical/dist/

@@ -57,6 +57,12 @@ const (
 	TypeRelayRamp        Type = "relay-ramp"
 	TypeSSHAuthorize     Type = "ssh-authorize"
 	TypeSSHOffer         Type = "ssh-offer"
+	TypeMultiRelayOffer  Type = "multi-relay-offer"
+	TypeMultiRelayAck    Type = "multi-relay-ack"
+	TypeChunkAck         Type = "chunk-ack"
+	TypeControlResume    Type = "control-resume"
+	TypeGroupKey         Type = "group-key"
+	TypeFanoutStatus     Type = "fanout-status"
 )
 
 // FeatureSSHRendezvous marks the unencrypted PAKE negotiation for a shared

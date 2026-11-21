@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 
 	log "github.com/schollz/croc/v11/src/logger"
@@ -33,6 +34,16 @@ func (c *Client) preflightReceiveFile(index int) (receiveDecision, error) {
 		return receiveDecision{}, err
 	}
 	stat, err := root.Lstat(destination)
+	if os.IsNotExist(err) && file.Size > 0 && file.Symlink == "" {
+		// Detect a .partial file left by an interrupted or kicked fan-out session
+		// and promote it so standard 1-on-1 resume can complete the missing chunks.
+		partialDest := destination + ".partial"
+		if partialStat, partialErr := root.Lstat(partialDest); partialErr == nil && partialStat.Mode().IsRegular() && partialStat.Size() == file.Size {
+			if renErr := root.Rename(partialDest, destination); renErr == nil {
+				stat, err = root.Lstat(destination)
+			}
+		}
+	}
 	if err != nil && !os.IsNotExist(err) {
 		return receiveDecision{}, err
 	}
@@ -43,11 +54,14 @@ func (c *Client) preflightReceiveFile(index int) (receiveDecision, error) {
 	}
 	matches := false
 	if exists && file.Size > 0 && file.Symlink == "" && stat.Mode().IsRegular() && stat.Size() == file.Size {
-		hash, err := receiveFileHash(c.clientContext(), destination, c.Options.HashAlgorithm, !c.Options.SendingText)
-		if err != nil {
-			return receiveDecision{}, fmt.Errorf("hash existing destination %q: %w", destination, err)
+		fullDest := filepath.Join(root.Name(), filepath.FromSlash(destination))
+		if _, mapErr := os.Stat(fullDest + ".partial.crocmap"); os.IsNotExist(mapErr) {
+			hash, err := receiveFileHash(c.clientContext(), fullDest, c.Options.HashAlgorithm, !c.Options.SendingText)
+			if err != nil {
+				return receiveDecision{}, fmt.Errorf("hash existing destination %q: %w", destination, err)
+			}
+			matches = bytes.Equal(hash, file.Hash)
 		}
-		matches = bytes.Equal(hash, file.Hash)
 		if matches && c.progressiveHashActive() {
 			known, exact, pending := c.exactHashDecision(index)
 			switch {

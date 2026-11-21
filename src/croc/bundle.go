@@ -281,6 +281,9 @@ func (c *Client) bundleTransferEligible() bool {
 }
 
 func (c *Client) bundleSessionEligible() bool {
+	if c.dualRelayRequested() || c.DualRelayActive() {
+		return false
+	}
 	return c.bundles.peerHandshake && c.bundles.manifest && c.bundleTransferEligible()
 }
 

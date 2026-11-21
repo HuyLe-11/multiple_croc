@@ -210,7 +210,7 @@ func (c *Client) activateSecureChannel(attempt *transferAttemptState) (err error
 }
 
 func (c *Client) pakeFeatures() []string {
-	features := []string{inlinePeerMetadataFeature, progressiveFileHashFeature, chunkedFileInfoFeature, stagedTransportFeature, implicitTailcatReadyFeature, bundle.Feature, bundle.NativeFeature}
+	features := []string{inlinePeerMetadataFeature, progressiveFileHashFeature, chunkedFileInfoFeature, stagedTransportFeature, implicitTailcatReadyFeature, bundle.Feature, bundle.NativeFeature, dualRelayFeature}
 	if !c.localTailcatSupported() {
 		return features
 	}
@@ -222,7 +222,7 @@ func (c *Client) pakeFeatures() []string {
 }
 
 func (c *Client) localTailcatSupported() bool {
-	if c.Options.Transport == TransportRelay || c.Options.OnlyLocal || !c.dataTransport().Available() {
+	if c.dualRelayRequested() || c.Options.Transport == TransportRelay || c.Options.OnlyLocal || !c.dataTransport().Available() {
 		return false
 	}
 	if !c.Options.IsSender || c.Options.Transport == TransportDERP {

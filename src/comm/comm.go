@@ -64,7 +64,10 @@ func NewConnectionContext(ctx context.Context, address string, timelimit ...time
 	}
 	defer cancel()
 	var connection net.Conn
-	if Socks5Proxy != "" && !utils.IsLocalIP(address) {
+	if IsWebSocketAddress(address) {
+		log.Debugf("dialing websocket %s with timelimit %s", address, tlimit)
+		connection, err = dialWebSocketContext(dialCtx, address)
+	} else if Socks5Proxy != "" && !utils.IsLocalIP(address) {
 		var dialer proxy.Dialer
 		proxyAddress := Socks5Proxy
 		// prepend schema if no schema is given

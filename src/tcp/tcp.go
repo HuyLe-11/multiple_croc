@@ -46,6 +46,9 @@ type server struct {
 	joinLimitWindow               time.Duration
 	admissionLimits               *admissionLimiter
 	fastAdmission                 *RelayCapabilitySet
+	peers                         []string
+	meta                          RelayMeta
+	fanoutManager                 *FanoutManager
 
 	// stopRoomCleanup chan struct{}
 	// replaced by stop ctx.go
@@ -546,10 +549,20 @@ func (s *server) clientHandshake(c *comm.Comm, deadline, firstMessageDeadline ti
 	}
 	log.Debugf("sending '%s'", banner)
 	response := banner + "|||" + c.Connection().RemoteAddr().String()
+	capability := ""
 	if result.room != "" && s.fastAdmission != nil && s.banner != "" {
-		if capability, issueErr := s.fastAdmission.issue(canonicalSource(c.Connection().RemoteAddr()), result.room); issueErr == nil {
-			response += "|||" + capability
+		if issued, issueErr := s.fastAdmission.issue(canonicalSource(c.Connection().RemoteAddr()), result.room); issueErr == nil {
+			capability = issued
 		}
+	}
+	metaStr, metaErr := EncodeRelayMeta(s.effectiveRelayMeta())
+	if metaErr != nil {
+		return handshakeResult{}, metaErr
+	}
+	if metaStr != "" {
+		response += "|||" + capability + "|||" + metaStr
+	} else if capability != "" {
+		response += "|||" + capability
 	}
 	bSend, err := crypt.Encrypt([]byte(response), strongKeyForEncryption)
 	if err != nil {
@@ -599,6 +612,14 @@ func (s *server) clientCommunication(c *comm.Comm, handshake handshakeResult) (r
 			return room, err
 		}
 		return room, ErrAdmissionLimited
+	}
+
+	if IsFanoutRoom(room) {
+		if s.fanoutManager == nil {
+			_ = sendAdmission("fanout unsupported")
+			return room, errors.New("fanout is not enabled on this relay")
+		}
+		return room, s.fanoutManager.handleClient(s.stop.ctx, c, handshake)
 	}
 
 	admission := s.admitToRoom(room, c)
@@ -866,9 +887,31 @@ func ConnectToTCPServerControl(address, password, room string, timelimit ...time
 	return ConnectToTCPServerControlContext(context.Background(), address, password, room, timelimit...)
 }
 
+func (s *server) effectiveRelayMeta() RelayMeta {
+	meta := s.meta
+	combined := make([]string, 0, len(s.peers)+len(meta.Peers))
+	combined = append(combined, s.peers...)
+	combined = append(combined, meta.Peers...)
+	meta.Peers = NormalizePeerList(combined)
+	if s.fanoutManager != nil && s.banner != "" {
+		cfg := s.fanoutManager.Config()
+		meta.Fanout = true
+		meta.FanoutMaxReceivers = cfg.MaxReceivers
+		meta.FanoutBufferBytes = cfg.MaxBufferBytes
+	}
+	return meta
+}
+
 // ConnectToTCPServerControlContext joins a control room and closes the
 // connection if the caller cancels during dialing or relay authentication.
 func ConnectToTCPServerControlContext(ctx context.Context, address, password, room string, timelimit ...time.Duration) (c *comm.Comm, banner string, ipaddr string, capability string, err error) {
+	c, banner, ipaddr, capability, _, err = ConnectToTCPServerControlMetaContext(ctx, address, password, room, timelimit...)
+	return
+}
+
+// ConnectToTCPServerControlMetaContext joins a control room and returns any
+// optional fast-admission capability and extension metadata advertised by the relay.
+func ConnectToTCPServerControlMetaContext(ctx context.Context, address, password, room string, timelimit ...time.Duration) (c *comm.Comm, banner string, ipaddr string, capability string, meta RelayMeta, err error) {
 	defer func() { err = redact.Error(err, password, room) }()
 	c, err = comm.NewConnectionContext(ctx, address, timelimit...)
 	if err != nil {
@@ -877,7 +920,7 @@ func ConnectToTCPServerControlContext(ctx context.Context, address, password, ro
 	}
 	stopClose := context.AfterFunc(ctx, c.Close)
 	defer stopClose()
-	banner, ipaddr, capability, err = HandshakeTCPServerCapability(c, password, room)
+	banner, ipaddr, capability, meta, err = HandshakeTCPServerMeta(c, password, room)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		err = ctxErr
 	}
@@ -952,6 +995,13 @@ func HandshakeTCPServer(c *comm.Comm, password, room string) (banner string, ipa
 // HandshakeTCPServerCapability is HandshakeTCPServer plus the optional opaque
 // data-port capability advertised by an upgraded relay.
 func HandshakeTCPServerCapability(c *comm.Comm, password, room string) (banner string, ipaddr string, capability string, err error) {
+	banner, ipaddr, capability, _, err = HandshakeTCPServerMeta(c, password, room)
+	return
+}
+
+// HandshakeTCPServerMeta is HandshakeTCPServerCapability plus optional
+// structured RelayMeta advertised in the fourth banner field.
+func HandshakeTCPServerMeta(c *comm.Comm, password, room string) (banner string, ipaddr string, capability string, meta RelayMeta, err error) {
 	defer func() { err = redact.Error(err, password, room) }()
 
 	// get PAKE connection with server to establish strong key to transfer info
@@ -1047,6 +1097,9 @@ func HandshakeTCPServerCapability(c *comm.Comm, password, room string) (banner s
 	if len(parts) > 2 {
 		capability = parts[2]
 	}
+	if len(parts) > 3 {
+		meta, _ = ParseRelayMeta(parts[3])
+	}
 	log.Debug("waiting for room confirmation")
 	enc, err = c.Receive()
 	if err != nil {
@@ -1058,14 +1111,17 @@ func HandshakeTCPServerCapability(c *comm.Comm, password, room string) (banner s
 		log.Debug(err)
 		return
 	}
-	if !bytes.Equal(data, []byte("ok")) {
+	if !bytes.Equal(data, []byte("ok")) && !strings.HasPrefix(string(data), "ok:") {
 		if bytes.Equal(data, []byte("rate limited")) {
 			err = ErrAdmissionLimited
 		} else {
-			err = fmt.Errorf("relay admission rejected")
+			err = fmt.Errorf("relay admission rejected: %s", string(data))
 		}
 		log.Debug(err)
 		return
+	}
+	if strings.HasPrefix(string(data), "ok:") {
+		meta.WSPublicURL = string(data)
 	}
 	log.Debug("all set")
 	return

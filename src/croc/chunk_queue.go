@@ -84,6 +84,10 @@ func (c *Client) startSenderChunkQueue(attempt *transferAttemptState, file *os.F
 }
 
 func (c *Client) startSenderUnit(attempt *transferAttemptState, file *os.File, size int64, compressed bool, ranges []int64, progress func(int64, int)) {
+	if c.dualRelay.active.Load() || (c.dualRelayRequested() && c.dualRelay.peerSupported) {
+		c.startDualRelaySenderUnit(attempt, file, size, compressed, ranges, progress)
+		return
+	}
 	queue := newRequestedChunkQueue(
 		ranges,
 		size,
@@ -142,6 +146,13 @@ func (c *Client) startLateSenderWorker(dataConn *comm.Comm, expectedAttempt *tra
 // Detach under the same lock used to admit late workers, then join every
 // admitted worker before a new payload may use these untagged data frames.
 func (c *Client) joinSenderUnit() {
+	c.dualRelay.mu.Lock()
+	sched := c.dualRelay.scheduler
+	c.dualRelay.scheduler = nil
+	c.dualRelay.mu.Unlock()
+	if sched != nil {
+		sched.Close()
+	}
 	c.senderDataMu.Lock()
 	queue := c.senderChunkQueue
 	c.senderChunkQueue, c.senderDataFile, c.senderDataAttempt = nil, nil, nil

@@ -132,7 +132,21 @@ type Options struct {
 	DisableClipboard  bool
 	ExtendedClipboard bool
 	NoUpdateCheck     bool
-	Transport         TransportMode `json:",omitempty"`
+	Transport                TransportMode `json:",omitempty"`
+	DualRelay                bool          `json:",omitempty"`
+	SecondaryRelay           string        `json:",omitempty"`
+	ChunkPolicy              string        `json:",omitempty"`
+	FanoutReceivers          int           `json:",omitempty"`
+	FanoutMinReceivers       int           `json:",omitempty"`
+	FanoutWaitTimeout        time.Duration `json:",omitempty"`
+	FanoutBufferBytes        int64         `json:",omitempty"`
+	FanoutMinRateBps         int64         `json:",omitempty"`
+	FanoutRateWindow         time.Duration `json:",omitempty"`
+	FanoutStallTimeout       time.Duration `json:",omitempty"`
+	FanoutStrictRate         bool          `json:",omitempty"`
+	FanoutMode               bool          `json:",omitempty"`
+	OutputDir                string        `json:"-"`
+	SimulatedReceiverRateBps int64         `json:"-"`
 }
 
 // TransportMode controls how a sender selects the file-data connection after
@@ -242,6 +256,7 @@ type Client struct {
 	nextReconnectRoom          string
 	relayControlAddress        string
 	relayCapability            string
+	relayMeta                  tcp.RelayMeta
 	relayControlPeerToPeer     bool
 	reconnectRelayAddresses    []string
 	reconnectRelayMu           sync.Mutex
@@ -255,6 +270,11 @@ type Client struct {
 	peerImplicitTailcatReady   bool
 	incomingFileManifest       *incomingFileManifest
 	tailcat                    tailcatClientState
+	dualRelay                  dualRelayClientState
+	FanoutResults              []FanoutPeerSummary
+	FanoutKicked               bool
+	FanoutKickReason           string
+	FanoutPartialPath          string
 	transportSelectionReceived bool
 	selectedDataTransport      atomic.Int32
 	senderRouteReady           chan struct{}
@@ -420,6 +440,10 @@ func newClient(ops Options, transport tailcatDataTransport) (c *Client, err erro
 	// setup basic info
 	c.Options = ops
 	c.Options.Transport, err = ParseTransportMode(string(c.Options.Transport))
+	if err != nil {
+		return nil, err
+	}
+	c.Options.ChunkPolicy, err = ParseChunkPolicy(c.Options.ChunkPolicy)
 	if err != nil {
 		return nil, err
 	}
@@ -610,6 +634,13 @@ func normalizeRelayAddress(address string) string {
 	if address == "" {
 		return ""
 	}
+	if comm.IsWebSocketAddress(address) {
+		normalized, err := comm.NormalizeWebSocketURL(address)
+		if err != nil {
+			return ""
+		}
+		return normalized
+	}
 	host, port, _ := net.SplitHostPort(address)
 	if port == "" {
 		host = address
@@ -673,6 +704,18 @@ func (c *Client) currentRelayControlRoute() (address, capability string) {
 	return c.relayControlAddress, c.relayCapability
 }
 
+func (c *Client) setRelayControlMeta(meta tcp.RelayMeta) {
+	c.reconnectRelayMu.Lock()
+	defer c.reconnectRelayMu.Unlock()
+	c.relayMeta = meta
+}
+
+func (c *Client) currentRelayControlMeta() tcp.RelayMeta {
+	c.reconnectRelayMu.Lock()
+	defer c.reconnectRelayMu.Unlock()
+	return c.relayMeta
+}
+
 func (c *Client) relayControlRouteIsPeerToPeer(address string) bool {
 	address = normalizeRelayAddress(address)
 	c.reconnectRelayMu.Lock()
@@ -734,6 +777,7 @@ func (c *Client) closeAttempt() {
 			conn.Close()
 		}
 	}
+	c.closeDualRelayConnections()
 	c.closeTailcatBundle()
 	c.receiveMutex.Lock()
 	if c.CurrentFile != nil && !c.CurrentFileIsClosed {
@@ -760,6 +804,7 @@ func (c *Client) resetForReconnectAttempt(attempt int) error {
 	}
 	c.Options.RoomName = c.nextReconnectRoom
 	c.resetLifecycle()
+	c.resetDualRelayState()
 	c.Key = nil
 	c.dataAEAD = nil
 	c.pakeInitiator = nil
@@ -984,7 +1029,11 @@ func (c *Client) receiveFilesystem() (*receivefs.Root, error) {
 	if c.receiveRoot != nil {
 		return c.receiveRoot, nil
 	}
-	root, err := receivefs.OpenRoot(".")
+	dir := "."
+	if strings.TrimSpace(c.Options.OutputDir) != "" {
+		dir = c.Options.OutputDir
+	}
+	root, err := receivefs.OpenRoot(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -1785,6 +1834,9 @@ func (c *Client) receiverReconnectRelayAttempt(attempt int) error {
 
 // Send will send the specified file
 func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, totalNumberFolders int) (err error) {
+	if c.Options.FanoutReceivers > 1 || c.Options.FanoutMode {
+		return c.sendFanout(filesInfo, emptyFoldersToTransfer, totalNumberFolders)
+	}
 	defer func() { err = c.redactError(err) }()
 	go c.stop.done()
 	defer c.stop.Cancel()
@@ -1875,6 +1927,7 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 			}
 
 			c.setRelayControlRoute(route.address, route.capability, false)
+			c.setRelayControlMeta(route.meta)
 			c.setConnection(0, route.connection)
 			c.Options.RelayPorts = strings.Split(route.banner, ",")
 			if c.Options.NoMultiplexing {
@@ -2020,6 +2073,9 @@ func (c *Client) discoverReceivePeers() (discoveries []peerdiscovery.Discovered)
 
 // Receive will receive a file
 func (c *Client) Receive() (err error) {
+	if c.Options.FanoutMode {
+		return c.receiveFanout()
+	}
 	defer func() { err = c.redactError(err) }()
 	go c.stop.done()
 	defer c.stop.Cancel()
@@ -2074,6 +2130,7 @@ func (c *Client) Receive() (err error) {
 	defer route.connection.Close()
 	c.setConnection(0, route.connection)
 	c.setRelayControlRoute(route.address, route.capability, usingLocal || isIPset)
+	c.setRelayControlMeta(route.meta)
 	log.Debugf("receiver connection established: %+v", c.connection(0))
 	log.Debugf("banner: %s", route.banner)
 	banner := route.banner
@@ -2333,7 +2390,7 @@ func (c *Client) transfer() (err error) {
 			case <-readerStop:
 				return
 			}
-			data, receiveErr := attempt.control.Receive()
+			data, receiveErr := c.receiveControlFrameWithFailover(attempt)
 			if receiveErr != nil {
 				cancelAttempt(transferDisconnectError{err: receiveErr})
 			}
@@ -2777,6 +2834,7 @@ func (c *Client) processMessagePake(m message.Message, attempt *transferAttemptS
 	c.peerChunkedFileInfo = supportsFeature(m.Features, chunkedFileInfoFeature)
 	c.peerStagedTransport = supportsFeature(m.Features, stagedTransportFeature)
 	c.peerImplicitTailcatReady = supportsFeature(m.Features, implicitTailcatReadyFeature)
+	c.dualRelay.peerSupported = supportsFeature(m.Features, dualRelayFeature)
 	c.bundles.peerHandshake = supportsFeature(m.Features, bundle.Feature)
 	c.bundles.peerNative = c.bundles.peerHandshake && supportsFeature(m.Features, bundle.NativeFeature)
 	if c.pakeConfirmationPending || c.Key != nil {
@@ -2924,7 +2982,10 @@ func (c *Client) activateRelayDataChannels(attempt *transferAttemptState) (err e
 	}
 	c.selectedDataTransport.Store(selectedTransportRelay)
 	attempt.finishTailcatSetup()
-	return c.finishDataTransportActivation()
+	if err := c.finishDataTransportActivation(); err != nil {
+		return err
+	}
+	return c.initiateDualRelayOffer(attempt)
 }
 
 func (c *Client) openRelayDataChannels(attempt *transferAttemptState, indices []int, startReceive bool) (err error) {
@@ -2934,9 +2995,10 @@ func (c *Client) openRelayDataChannels(attempt *transferAttemptState, indices []
 		relayControlAddress = c.Options.RelayAddress
 	}
 	relayControlAddress = normalizeRelayAddress(relayControlAddress)
-	relayHost, _, err := net.SplitHostPort(relayControlAddress)
-	if err != nil {
-		return fmt.Errorf("bad relay address %s: %w", relayControlAddress, err)
+	if !comm.IsWebSocketAddress(relayControlAddress) {
+		if _, _, err := net.SplitHostPort(relayControlAddress); err != nil {
+			return fmt.Errorf("bad relay address %s: %w", relayControlAddress, err)
+		}
 	}
 
 	errc := make(chan error, len(indices))
@@ -2950,7 +3012,11 @@ func (c *Client) openRelayDataChannels(attempt *transferAttemptState, indices []
 		log.Debugf("port: [%s]", c.Options.RelayPorts[index])
 		go func(j int) {
 			defer wg.Done()
-			server := net.JoinHostPort(relayHost, c.Options.RelayPorts[j])
+			server, addrErr := comm.JoinRelayAddressPort(relayControlAddress, c.Options.RelayPorts[j])
+			if addrErr != nil {
+				errc <- addrErr
+				return
+			}
 			log.Debugf("connecting to %s", server)
 			dataConn, _, _, fast, connErr := tcp.ConnectToTCPServerWithCapabilityContext(
 				c.stop.ctx,
@@ -2970,6 +3036,9 @@ func (c *Client) openRelayDataChannels(attempt *transferAttemptState, indices []
 				return
 			}
 			installed := c.installRelayDataConnection(j+1, dataConn)
+			if installed {
+				c.registerDualRelayDataConn(0, j, dataConn)
+			}
 			attempt.dataMu.Unlock()
 			if !installed {
 				return
@@ -2979,7 +3048,7 @@ func (c *Client) openRelayDataChannels(attempt *transferAttemptState, indices []
 				log.Debugf("used fast relay admission on data port %d", j)
 			}
 			if startReceive && !c.Options.IsSender {
-				c.startReceiveData(j, dataConn, attempt)
+				c.startReceiveDataForRelay(0, j, dataConn, attempt)
 			} else if c.Options.IsSender {
 				c.startLateSenderWorker(dataConn, attempt)
 			}
@@ -3084,8 +3153,16 @@ func (c *Client) processMessage(payload []byte, attempt *transferAttemptState) (
 	switch m.Type {
 	case message.TypeBundleRequest, message.TypeBundleOffer, message.TypeBundleReady, message.TypeBundleDone, message.TypeBundleClosed:
 		err = bundleVisibleError(c.processBundleMessage(m, attempt))
+	case message.TypeMultiRelayOffer:
+		err = c.processMultiRelayOffer(m, attempt)
+	case message.TypeMultiRelayAck:
+		err = c.processMultiRelayAck(m, attempt)
+	case message.TypeChunkAck:
+		err = c.processChunkAck(m, attempt)
+	case message.TypeControlResume:
+		err = c.processControlResume(m, attempt)
 	case message.TypeFinished:
-		err = message.Send(c.connection(0), c.Key, message.Message{
+		err = c.sendControlMessage(message.Message{
 			Type: message.TypeFinished,
 		})
 		done = true
@@ -3184,6 +3261,7 @@ func (c *Client) processMessage(payload []byte, attempt *transferAttemptState) (
 			}
 		}
 	case message.TypeCloseSender:
+		c.markCurrentFileAllAcked()
 		c.finishProgress()
 		log.Debug("close-sender received...")
 		c.updateLifecycle(func(state *transferLifecycle) {
@@ -3191,7 +3269,7 @@ func (c *Client) processMessage(payload []byte, attempt *transferAttemptState) (
 			state.RecipientRequested = false
 		})
 		log.Debug("sending close-recipient")
-		err = message.Send(c.connection(0), c.Key, message.Message{
+		err = c.sendControlMessage(message.Message{
 			Type: message.TypeCloseRecipient,
 		})
 	case message.TypeCloseRecipient:
@@ -3215,6 +3293,9 @@ func (c *Client) processMessage(payload []byte, attempt *transferAttemptState) (
 func (c *Client) updateIfSenderChannelSecured() (err error) {
 	state := c.lifecycleSnapshot()
 	if c.Options.IsSender && state.ChannelSecured && !state.FileInfoTransferred {
+		if c.isDualRelayNegotiationPending() {
+			return nil
+		}
 		if err := c.waitForFilesReady(c.stop.ctx); err != nil {
 			return err
 		}
@@ -3293,6 +3374,12 @@ func (c *Client) recipientInitializeFile() (err error) {
 		}
 	}
 	var errOpen error
+	if _, lErr := root.Lstat(pathToFile); os.IsNotExist(lErr) {
+		partialPath := pathToFile + ".partial"
+		if pStat, pErr := root.Lstat(partialPath); pErr == nil && pStat.Mode().IsRegular() && pStat.Size() == c.FilesToTransfer[c.FilesToTransferCurrentNum].Size {
+			_ = root.Rename(partialPath, pathToFile)
+		}
+	}
 	c.CurrentFile, errOpen = root.OpenFile(
 		pathToFile,
 		os.O_RDWR, 0o666)
@@ -3300,15 +3387,21 @@ func (c *Client) recipientInitializeFile() (err error) {
 	c.CurrentFileChunkRanges = []int64{}
 	if errOpen == nil {
 		stat, _ := c.CurrentFile.Stat()
-		truncate = stat.Size() != c.FilesToTransfer[c.FilesToTransferCurrentNum].Size
+		fileInfo := c.FilesToTransfer[c.FilesToTransferCurrentNum]
+		truncate = stat.Size() != fileInfo.Size
 		if !truncate {
-			// recipient requests the file and chunks (if empty, then should receive all chunks)
-			// TODO: determine the missing chunks
-			c.CurrentFileChunkRanges = utils.MissingChunks(
-				pathToFile,
-				c.FilesToTransfer[c.FilesToTransferCurrentNum].Size,
-				models.TCP_BUFFER_SIZE/2,
-			)
+			crocmapAbs := filepath.Join(root.Name(), filepath.FromSlash(pathToFile+".partial.crocmap"))
+			if bm, bmErr := LoadChunkBitmapSidecar(crocmapAbs, fileInfo.Size, models.TCP_BUFFER_SIZE/2, fileInfo.Hash); bmErr == nil {
+				c.CurrentFileChunkRanges = bm.MissingRanges()
+				_ = os.Remove(crocmapAbs)
+			} else {
+				// recipient requests the file and chunks (if empty, then should receive all chunks)
+				c.CurrentFileChunkRanges = utils.MissingChunks(
+					filepath.Join(root.Name(), filepath.FromSlash(pathToFile)),
+					fileInfo.Size,
+					models.TCP_BUFFER_SIZE/2,
+				)
+			}
 		}
 	} else {
 		c.CurrentFile, errOpen = root.OpenFile(pathToFile, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o666)
@@ -3339,7 +3432,7 @@ func (c *Client) recipientGetFileReady(finished bool) (err error) {
 	if finished {
 		// TODO: do the last finishing stuff
 		log.Debug("finished")
-		err = message.Send(c.connection(0), c.Key, message.Message{
+		err = c.sendControlMessage(message.Message{
 			Type: message.TypeFinished,
 		})
 		if err != nil {
@@ -3357,6 +3450,11 @@ func (c *Client) recipientGetFileReady(finished bool) (err error) {
 		c.TotalSent = 0
 		c.TotalChunksTransferred = 0
 		c.CurrentFileIsClosed = false
+		fileSize := c.FilesToTransfer[c.FilesToTransferCurrentNum].Size
+		totalChunks := utils.ChunkRangesCount(nil, fileSize, models.TCP_BUFFER_SIZE/2)
+		bm := newChunkBitmap(totalChunks, fileSize, models.TCP_BUFFER_SIZE/2)
+		bm.PreMarkPresent(c.CurrentFileChunkRanges)
+		c.setCurrentReceiveBitmap(bm)
 	}
 	c.receiveMutex.Unlock()
 	if err != nil {
@@ -3388,7 +3486,7 @@ func (c *Client) recipientGetFileReady(finished bool) (err error) {
 
 	log.Debugf("sending recipient ready with %d chunks", c.CurrentFileChunkCount)
 	c.markStartup("recipient-ready")
-	err = message.Send(c.connection(0), c.Key, message.Message{
+	err = c.sendControlMessage(message.Message{
 		Type:  message.TypeRecipientReady,
 		Bytes: bRequest,
 	})
@@ -3658,12 +3756,16 @@ func (c *Client) setBar() {
 }
 
 func (c *Client) receiveData(i int, dataConn *comm.Comm, attempt *transferAttemptState) {
+	c.receiveDataWithRelay(0, i, dataConn, attempt)
+}
+
+func (c *Client) receiveDataWithRelay(relayID, i int, dataConn *comm.Comm, attempt *transferAttemptState) {
 	defer func() {
 		if r := recover(); r != nil {
 			attempt.report(fmt.Errorf("receive data panic: %v", r))
 		}
 	}()
-	log.Tracef("%d receiving data", i)
+	log.Tracef("%d receiving data (relay %d)", i, relayID)
 	var receiveBuffer []byte
 	var decompressedBuffer []byte
 	for {
@@ -3674,6 +3776,9 @@ func (c *Client) receiveData(i int, dataConn *comm.Comm, attempt *transferAttemp
 			}
 			if c.ctxErr() == nil {
 				if c.activeTransferStarted() {
+					if c.onReceiverDataConnError(relayID, err, attempt) {
+						return
+					}
 					attempt.report(transferDisconnectError{err: err})
 				} else if c.selectedDataTransport.Load() == selectedTransportTailcat {
 					attempt.report(c.tailcatError("data connection", err, ""))
@@ -3751,7 +3856,7 @@ func (c *Client) receiveData(i int, dataConn *comm.Comm, attempt *transferAttemp
 				log.Tracef("Successful closing %s", file.Name())
 			}
 			log.Tracef("sending close-sender")
-			if sendErr := message.Send(c.connection(0), c.Key, message.Message{
+			if sendErr := c.sendControlMessage(message.Message{
 				Type: message.TypeCloseSender,
 			}); sendErr != nil {
 				log.Tracef("sending close-sender: %v", sendErr)
@@ -3769,11 +3874,18 @@ func (c *Client) receiveData(i int, dataConn *comm.Comm, attempt *transferAttemp
 			return
 		}
 
+		chunkIdx := int(positionInt64 / int64(models.TCP_BUFFER_SIZE/2))
 		c.receiveMutex.Lock()
 		if c.CurrentFileIsClosed || c.CurrentFile != receiveFile {
 			c.receiveMutex.Unlock()
 			return
 		}
+		if !c.markReceivedChunkInBitmap(chunkIdx) {
+			c.receiveMutex.Unlock()
+			log.Tracef("ignoring duplicate chunk %d on relay %d", chunkIdx, relayID)
+			continue
+		}
+		c.dualRelay.relayChunksRecv[relayID&1].Add(1)
 		c.TotalSent += int64(len(data[8:]))
 		c.TotalChunksTransferred++
 		finished := c.TotalChunksTransferred == c.CurrentFileChunkCount ||
@@ -3784,6 +3896,7 @@ func (c *Client) receiveData(i int, dataConn *comm.Comm, attempt *transferAttemp
 		c.receiveMutex.Unlock()
 
 		c.addProgress(int64(len(data[8:])))
+		c.maybeSendChunkAck(finished)
 		if finished {
 			log.Debug("finished receiving!")
 			if err = receiveFile.Close(); err != nil {
@@ -3819,7 +3932,7 @@ func (c *Client) receiveData(i int, dataConn *comm.Comm, attempt *transferAttemp
 				fmt.Print(string(b))
 			}
 			log.Debug("sending close-sender")
-			err = message.Send(c.connection(0), c.Key, message.Message{
+			err = c.sendControlMessage(message.Message{
 				Type: message.TypeCloseSender,
 			})
 			if err != nil {

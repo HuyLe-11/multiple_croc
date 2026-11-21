@@ -164,6 +164,32 @@ func WithRoomTTL(ttl time.Duration) serverOptsFunc {
 	}
 }
 
+// WithPeers configures static peer relay addresses advertised in the fourth
+// field of the relay authentication response.
+func WithPeers(peers []string) serverOptsFunc {
+	return func(s *server) error {
+		s.peers = NormalizePeerList(peers)
+		return nil
+	}
+}
+
+// WithRelayMeta configures structured extension metadata advertised in the
+// fourth field of the relay authentication response.
+func WithRelayMeta(meta RelayMeta) serverOptsFunc {
+	return func(s *server) error {
+		s.meta = meta
+		return nil
+	}
+}
+
+// WithFanoutManager shares one 1-to-N FanoutManager across all ports of a relay.
+func WithFanoutManager(manager *FanoutManager) serverOptsFunc {
+	return func(s *server) error {
+		s.fanoutManager = manager
+		return nil
+	}
+}
+
 func containsSlice(s []string, e string) bool {
 	return slices.Contains(s, e)
 }

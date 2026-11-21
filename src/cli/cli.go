@@ -108,6 +108,14 @@ func newApp() *cli.App {
 				&cli.StringFlag{Name: "socks5", Value: "", Usage: "SOCKS5 proxy address (relay DNS is resolved by the proxy)", EnvVars: []string{"SOCKS5_PROXY"}},
 				&cli.StringFlag{Name: "connect", Value: "", Usage: "add a http proxy", EnvVars: []string{"HTTP_PROXY"}},
 				&cli.BoolFlag{Name: "store", Usage: "upload encrypted files for a finite lifetime or a limited number of verified downloads"},
+				&cli.BoolFlag{Name: "dual-relay", Usage: "use two relays in parallel when a peer relay is available (falls back to one relay)"},
+				&cli.StringFlag{Name: "relay2", Value: "", Usage: "optional secondary relay address (host:port or ws(s)://...)", EnvVars: []string{"CROC_RELAY2"}},
+				&cli.StringFlag{Name: "chunk-policy", Value: croc.ChunkPolicyDynamic, Usage: "chunk scheduling policy across multiple relays (dynamic, parity)"},
+				&cli.IntFlag{Name: "receivers", Value: 1, Usage: "number of concurrent receivers for 1-to-N fan-out transfer"},
+				&cli.IntFlag{Name: "min-receivers", Value: 1, Usage: "minimum receivers required when --wait-timeout expires"},
+				&cli.DurationFlag{Name: "wait-timeout", Value: 60 * time.Second, Usage: "how long to wait for all receivers in fan-out lobby"},
+				&cli.IntFlag{Name: "min-rate", Value: int(tcp.DEFAULT_FANOUT_MIN_RATE), Usage: "minimum receiver speed in bytes/sec before relay kicks slow receiver"},
+				&cli.BoolFlag{Name: "strict-min-rate", Usage: "apply minimum speed kick even to the last remaining receiver"},
 			}, storedUploadFlags("store-")...),
 			HelpName: "croc send",
 			Action:   send,
@@ -175,6 +183,14 @@ func newApp() *cli.App {
 				&cli.IntFlag{Name: "source-join-limit", Value: tcp.DEFAULT_SOURCE_JOIN_LIMIT, Usage: "maximum room joins per source IP in the admission window", EnvVars: []string{"CROC_SOURCE_JOIN_LIMIT"}},
 				&cli.IntFlag{Name: "room-join-limit", Value: tcp.DEFAULT_ROOM_JOIN_LIMIT, Usage: "maximum joins per room in the admission window", EnvVars: []string{"CROC_ROOM_JOIN_LIMIT"}},
 				&cli.DurationFlag{Name: "join-limit-window", Value: tcp.DEFAULT_JOIN_LIMIT_WINDOW, Usage: "sliding window for relay admission limits", EnvVars: []string{"CROC_JOIN_LIMIT_WINDOW"}},
+				&cli.StringFlag{Name: "peers", Value: "", Usage: "comma-separated peer relay addresses advertised to clients (host:port or ws(s)://...)", EnvVars: []string{"CROC_PEERS"}},
+				&cli.StringFlag{Name: "ws-listen", Value: "", Usage: "optional HTTP/WebSocket bridge listen address for the relay (e.g. 127.0.0.1:8080)", EnvVars: []string{"CROC_WS_LISTEN"}},
+				&cli.IntFlag{Name: "fanout-buffer", Value: int(tcp.DEFAULT_FANOUT_BUFFER), Usage: "maximum RAM buffer in bytes per 1-to-N fan-out room", EnvVars: []string{"CROC_FANOUT_BUFFER"}},
+				&cli.IntFlag{Name: "fanout-max-memory", Value: int(tcp.DEFAULT_FANOUT_MAX_MEMORY), Usage: "total RAM budget in bytes across all fan-out rooms", EnvVars: []string{"CROC_FANOUT_MAX_MEMORY"}},
+				&cli.IntFlag{Name: "fanout-max-receivers", Value: tcp.DEFAULT_FANOUT_MAX_RECEIVERS, Usage: "maximum concurrent receivers per fan-out room", EnvVars: []string{"CROC_FANOUT_MAX_RECEIVERS"}},
+				&cli.IntFlag{Name: "fanout-min-rate", Value: int(tcp.DEFAULT_FANOUT_MIN_RATE), Usage: "default minimum receiver speed in bytes/sec before kicking", EnvVars: []string{"CROC_FANOUT_MIN_RATE"}},
+				&cli.DurationFlag{Name: "fanout-rate-window", Value: tcp.DEFAULT_FANOUT_RATE_WINDOW, Usage: "sliding time window used to measure receiver speed", EnvVars: []string{"CROC_FANOUT_RATE_WINDOW"}},
+				&cli.DurationFlag{Name: "fanout-stall-timeout", Value: tcp.DEFAULT_FANOUT_STALL_TIMEOUT, Usage: "maximum time a fan-out receiver may stall without ACKs", EnvVars: []string{"CROC_FANOUT_STALL_TIMEOUT"}},
 			},
 		},
 		{
@@ -221,6 +237,9 @@ func newApp() *cli.App {
 		&cli.StringFlag{Name: "socks5", Value: "", Usage: "SOCKS5 proxy address (relay DNS is resolved by the proxy)", EnvVars: []string{"SOCKS5_PROXY"}},
 		&cli.StringFlag{Name: "connect", Value: "", Usage: "add a http proxy", EnvVars: []string{"HTTP_PROXY"}},
 		&cli.StringFlag{Name: "throttleUpload", Value: "", Usage: "throttle the upload speed e.g. 500k"},
+		&cli.BoolFlag{Name: "fanout", Usage: "join a 1-to-N fan-out transfer session as a receiver"},
+		&cli.BoolFlag{Name: "no-local", Usage: "disable local relay and local LAN probing"},
+		&cli.IntFlag{Name: "sim-recv-rate", Value: 0, Usage: "simulate a maximum receiver download rate in bytes/sec (for testing/simulation)"},
 	}
 	app.EnableBashCompletion = true
 	app.HideHelp = false
@@ -683,6 +702,15 @@ func send(c *cli.Context) (err error) {
 		ExtendedClipboard: c.Bool("extended-clipboard"),
 		NoUpdateCheck:     c.Bool("no-update-check"),
 		Transport:         transport,
+		DualRelay:          c.Bool("dual-relay") || strings.TrimSpace(c.String("relay2")) != "",
+		SecondaryRelay:     strings.TrimSpace(c.String("relay2")),
+		ChunkPolicy:        c.String("chunk-policy"),
+		FanoutReceivers:    c.Int("receivers"),
+		FanoutMinReceivers: c.Int("min-receivers"),
+		FanoutWaitTimeout:  c.Duration("wait-timeout"),
+		FanoutMinRateBps:   int64(c.Int("min-rate")),
+		FanoutStrictRate:   c.Bool("strict-min-rate"),
+		FanoutMode:         c.Int("receivers") > 1 || c.Bool("fanout"),
 	}
 	if crocOptions.RelayAddress != models.DEFAULT_RELAY {
 		crocOptions.RelayAddress6 = ""
@@ -995,6 +1023,7 @@ func receive(c *cli.Context) (err error) {
 		Stdout:            c.Bool("stdout"),
 		Ask:               c.Bool("ask"),
 		RelayPassword:     determinePass(c),
+		DisableLocal:      c.Bool("no-local"),
 		OnlyLocal:         c.Bool("local"),
 		IP:                c.String("ip"),
 		Overwrite:         c.Bool("overwrite"),
@@ -1006,7 +1035,9 @@ func receive(c *cli.Context) (err error) {
 		DisableClipboard:  c.Bool("disable-clipboard"),
 		ExtendedClipboard: c.Bool("extended-clipboard"),
 		NoUpdateCheck:     c.Bool("no-update-check"),
-		Transport:         croc.TransportAuto,
+		Transport:                croc.TransportAuto,
+		FanoutMode:               c.Bool("fanout"),
+		SimulatedReceiverRateBps: int64(c.Int("sim-recv-rate")),
 	}
 	if crocOptions.RelayAddress != models.DEFAULT_RELAY {
 		crocOptions.RelayAddress6 = ""
@@ -1252,10 +1283,26 @@ func relay(c *cli.Context) (err error) {
 	}
 
 	tcpPorts := strings.Join(ports[1:], ",")
+	peers := tcp.NormalizePeerList([]string{c.String("peers")})
+	if wsListen := strings.TrimSpace(c.String("ws-listen")); wsListen != "" {
+		wsBridge, wsErr := tcp.StartWebSocketBridge(c.Context, wsListen, host, ports)
+		if wsErr != nil {
+			return wsErr
+		}
+		defer wsBridge.Close()
+	}
 	capabilitySet, capabilityErr := tcp.NewRelayCapabilitySet(min(len(ports)-1, 8))
 	if capabilityErr != nil {
 		return capabilityErr
 	}
+	fanoutManager := tcp.NewFanoutManager(tcp.FanoutConfig{
+		MaxBufferBytes: int64(c.Int("fanout-buffer")),
+		MaxMemoryBytes: int64(c.Int("fanout-max-memory")),
+		MaxReceivers:   c.Int("fanout-max-receivers"),
+		MinRateBps:     int64(c.Int("fanout-min-rate")),
+		RateWindow:     c.Duration("fanout-rate-window"),
+		StallTimeout:   c.Duration("fanout-stall-timeout"),
+	})
 	for i, port := range ports {
 		if i == 0 {
 			continue
@@ -1273,6 +1320,7 @@ func relay(c *cli.Context) (err error) {
 				tcp.WithHandshakeTimeout(handshakeTimeout),
 				tcp.WithAdmissionLimits(sourceJoinLimit, roomJoinLimit, joinLimitWindow),
 				tcp.WithFastAdmission(capabilitySet),
+				tcp.WithFanoutManager(fanoutManager),
 				tcp.WithCtx(c.Context),
 			)
 			if err != nil {
@@ -1293,8 +1341,10 @@ func relay(c *cli.Context) (err error) {
 		tcp.WithHandshakeTimeout(handshakeTimeout),
 		tcp.WithAdmissionLimits(sourceJoinLimit, roomJoinLimit, joinLimitWindow),
 		tcp.WithFastAdmission(capabilitySet),
+		tcp.WithFanoutManager(fanoutManager),
 		tcp.WithCtx(c.Context),
 		tcp.WithRoomPairedCallback(roomPaired),
 		tcp.WithRoomProtocolCallback(roomProtocol),
+		tcp.WithPeers(peers),
 	)
 }

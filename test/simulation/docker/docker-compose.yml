@@ -1,0 +1,170 @@
+name: croc-sim
+
+services:
+  relay-a:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: croc-sim-relay-a
+    hostname: relay-a
+    environment:
+      - SIM_ROLE=relay
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "9009-9013:9009-9013"
+    volumes:
+      - ./shared:/shared
+    command:
+      - croc
+      - relay
+      - --host
+      - 0.0.0.0
+      - --ports
+      - "9009,9010,9011,9012,9013"
+      - --peers
+      - "127.0.0.1:9019"
+      - --fanout-buffer
+      - "4194304"
+      - --fanout-max-memory
+      - "67108864"
+      - --fanout-max-receivers
+      - "8"
+      - --fanout-min-rate
+      - "262144"
+      - --fanout-rate-window
+      - "3s"
+      - --fanout-stall-timeout
+      - "8s"
+    networks:
+      - croc-net
+
+  relay-b:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: croc-sim-relay-b
+    hostname: relay-b
+    environment:
+      - SIM_ROLE=relay
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "9019-9023:9019-9023"
+      - "8080:8080"
+    volumes:
+      - ./shared:/shared
+    command:
+      - croc
+      - relay
+      - --host
+      - 0.0.0.0
+      - --ports
+      - "9019,9020,9021,9022,9023"
+      - --ws-listen
+      - "0.0.0.0:8080"
+      - --peers
+      - "127.0.0.1:9009"
+      - --fanout-buffer
+      - "4194304"
+      - --fanout-max-memory
+      - "67108864"
+      - --fanout-max-receivers
+      - "8"
+      - --fanout-min-rate
+      - "262144"
+      - --fanout-rate-window
+      - "3s"
+      - --fanout-stall-timeout
+      - "8s"
+    networks:
+      - croc-net
+
+  sender:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: croc-sim-sender
+    hostname: sender
+    environment:
+      - SIM_ROLE=client
+      - RELAY_A_HOST=${RELAY_A_HOST:-relay-a}
+      - RELAY_B_HOST=${RELAY_B_HOST:-relay-b}
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./shared:/shared
+    networks:
+      - croc-net
+
+  receiver-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: croc-sim-receiver-1
+    hostname: receiver-1
+    environment:
+      - SIM_ROLE=client
+      - RELAY_A_HOST=${RELAY_A_HOST:-relay-a}
+      - RELAY_B_HOST=${RELAY_B_HOST:-relay-b}
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./shared:/shared
+    networks:
+      - croc-net
+
+  receiver-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: croc-sim-receiver-2
+    hostname: receiver-2
+    environment:
+      - SIM_ROLE=client
+      - RELAY_A_HOST=${RELAY_A_HOST:-relay-a}
+      - RELAY_B_HOST=${RELAY_B_HOST:-relay-b}
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./shared:/shared
+    networks:
+      - croc-net
+
+  receiver-3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: croc-sim-receiver-3
+    hostname: receiver-3
+    environment:
+      - SIM_ROLE=client
+      - RELAY_A_HOST=${RELAY_A_HOST:-relay-a}
+      - RELAY_B_HOST=${RELAY_B_HOST:-relay-b}
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./shared:/shared
+    networks:
+      - croc-net
+
+  receiver-4:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: croc-sim-receiver-4
+    hostname: receiver-4
+    environment:
+      - SIM_ROLE=client
+      - RELAY_A_HOST=${RELAY_A_HOST:-relay-a}
+      - RELAY_B_HOST=${RELAY_B_HOST:-relay-b}
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./shared:/shared
+    networks:
+      - croc-net
+
+networks:
+  croc-net:
+    driver: bridge
