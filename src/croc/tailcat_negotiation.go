@@ -293,6 +293,12 @@ func (c *Client) startTailcatPreparation() {
 	if !ok || !dataTransport.Available() || c.Options.Transport == TransportRelay || c.Options.OnlyLocal {
 		return
 	}
+	// Dual-relay transfers never advertise Tailcat (localTailcatSupported), so
+	// preparing it would only contact the public Tailscale DERP map and DERP
+	// regions for nothing.
+	if c.dualRelayRequested() {
+		return
+	}
 	if c.Options.Transport == TransportAuto && c.tailcat.transferBytes.Load() < autoTailcatThresholdBytes {
 		return
 	}

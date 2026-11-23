@@ -12,6 +12,16 @@ import (
 
 var crocMapMagic = [8]byte{'C', 'R', 'O', 'C', 'M', 'A', 'P', '1'}
 
+const (
+	// maxRecentAcked bounds the out-of-order indices remembered between two
+	// ACKs. On overflow BuildAck rescans the bitmap instead of silently
+	// dropping indices: a dropped index stays "in flight" on the sender until
+	// the cumulative frontier passes it, which stalls the faster relay behind
+	// the slower one in dynamic mode.
+	maxRecentAcked = 4096
+	maxAckListLen  = 16384
+)
+
 // ChunkAckPayload carries cumulative and selective chunk acknowledgements
 // from a receiver to a sender, plus an optional failed-relay notification.
 type ChunkAckPayload struct {
@@ -35,6 +45,8 @@ type chunkBitmap struct {
 	setCount    int
 	cumChunk    int
 	recentAcked []uint32
+	ackOverflow bool
+	highest     int
 }
 
 func newChunkBitmap(totalChunks int, fileSize, chunkSize int64) *chunkBitmap {
@@ -68,9 +80,14 @@ func (b *chunkBitmap) Mark(chunkIdx int) bool {
 	}
 	b.words[wordIdx] |= bitMask
 	b.setCount++
+	b.highest = max(b.highest, chunkIdx)
 	b.advanceCumLocked()
-	if chunkIdx > b.cumChunk+64 && len(b.recentAcked) < 256 {
-		b.recentAcked = append(b.recentAcked, uint32(chunkIdx))
+	if chunkIdx > b.cumChunk+64 {
+		if len(b.recentAcked) < maxRecentAcked {
+			b.recentAcked = append(b.recentAcked, uint32(chunkIdx))
+		} else {
+			b.ackOverflow = true
+		}
 	}
 	return true
 }
@@ -218,9 +235,20 @@ func (b *chunkBitmap) BuildAck(fileIndex int, failedRelay int) ChunkAckPayload {
 		}
 	}
 	var extra []uint32
-	for _, idx := range b.recentAcked {
-		if int(idx) > b.cumChunk+64 {
-			extra = append(extra, idx)
+	if b.ackOverflow {
+		// Too many out-of-order arrivals since the last ACK: report every
+		// marked chunk beyond the bitmask window directly from the bitmap.
+		for idx := b.cumChunk + 65; idx <= b.highest && idx < b.totalChunks && len(extra) < maxAckListLen; idx++ {
+			if (b.words[idx/64] & (uint64(1) << uint(idx%64))) != 0 {
+				extra = append(extra, uint32(idx))
+			}
+		}
+		b.ackOverflow = false
+	} else {
+		for _, idx := range b.recentAcked {
+			if int(idx) > b.cumChunk+64 {
+				extra = append(extra, idx)
+			}
 		}
 	}
 	b.recentAcked = b.recentAcked[:0]

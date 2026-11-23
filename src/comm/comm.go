@@ -213,6 +213,13 @@ func (c *Comm) writeWithLimit(b []byte, maxMessageSize int) (n int, err error) {
 	var header [8]byte
 	copy(header[:4], MAGIC_BYTES)
 	binary.LittleEndian.PutUint32(header[4:], uint32(len(b)))
+	if _, messageOriented := c.connection.(*wsNetConn); messageOriented {
+		// net.Buffers falls back to one Write per buffer on non-TCP
+		// connections, and every websocket.NetConn Write is a separate
+		// WebSocket message (frame + flush + TLS record). Coalesce the 8-byte
+		// header with the payload so each croc frame is one message.
+		return c.writeCoalesced(header[:], b)
+	}
 	buffers := net.Buffers{header[:], b}
 	written, err := buffers.WriteTo(c.connection)
 	if err != nil {
@@ -225,6 +232,30 @@ func (c *Comm) writeWithLimit(b []byte, maxMessageSize int) (n int, err error) {
 		return
 	}
 	return
+}
+
+var coalesceBufferPool = sync.Pool{
+	New: func() any {
+		buffer := make([]byte, 0, 72*1024)
+		return &buffer
+	},
+}
+
+func (c *Comm) writeCoalesced(header, b []byte) (n int, err error) {
+	bufferPtr := coalesceBufferPool.Get().(*[]byte)
+	frame := append(append((*bufferPtr)[:0], header...), b...)
+	written, err := c.connection.Write(frame)
+	if cap(frame) <= 1<<20 {
+		*bufferPtr = frame[:0]
+		coalesceBufferPool.Put(bufferPtr)
+	}
+	if err != nil {
+		return written, fmt.Errorf("connection write failed: %w", err)
+	}
+	if written != len(frame) {
+		return written, fmt.Errorf("wanted to write %d but wrote %d", len(frame), written)
+	}
+	return written, nil
 }
 
 func validateMessageSize(size, maxMessageSize int) error {

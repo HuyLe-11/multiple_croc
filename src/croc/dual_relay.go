@@ -26,9 +26,15 @@ import (
 )
 
 const (
-	dualRelayFeature          = "dual-relay-v1"
-	dualRelayProbeTimeout     = 2 * time.Second
-	dualRelayConnectTimeout   = 5 * time.Second
+	dualRelayFeature        = "dual-relay-v1"
+	dualRelayProbeTimeout   = 2 * time.Second
+	dualRelayConnectTimeout = 5 * time.Second
+	// WebSocket relays (typically behind a Cloudflare tunnel) need DNS, TCP,
+	// TLS, the HTTP upgrade and the tunnel's own origin hop before the relay
+	// handshake even starts. With 200-400 ms tunnel RTTs the TCP timeouts
+	// above silently disabled the secondary relay.
+	dualRelayWSProbeTimeout   = 6 * time.Second
+	dualRelayWSConnectTimeout = 20 * time.Second
 	chunkAckBatchThreshold    = 4
 	chunkAckMinInterval       = 30 * time.Millisecond
 	inFlightWatchdogThreshold = 1200 * time.Millisecond
@@ -101,6 +107,30 @@ type dualRelayClientState struct {
 
 func (c *Client) dualRelayRequested() bool {
 	return c.Options.DualRelay || strings.TrimSpace(c.Options.SecondaryRelay) != ""
+}
+
+func dualRelayProbeTimeoutFor(address string) time.Duration {
+	if comm.IsWebSocketAddress(address) {
+		return dualRelayWSProbeTimeout
+	}
+	return dualRelayProbeTimeout
+}
+
+func dualRelayConnectTimeoutFor(address string) time.Duration {
+	if comm.IsWebSocketAddress(address) {
+		return dualRelayWSConnectTimeout
+	}
+	return dualRelayConnectTimeout
+}
+
+// warnDualRelayFallback reports that a requested dual-relay transfer is
+// continuing over one relay. Clients run at warn level by default, so the
+// previous Info-level messages made this fallback invisible to users.
+func (c *Client) warnDualRelayFallback(format string, args ...any) {
+	c.dualRelay.mu.Lock()
+	c.dualRelay.negotiated = true
+	c.dualRelay.mu.Unlock()
+	log.Warnf("dual-relay: "+format+"; continuing with a single relay", args...)
 }
 
 // DualRelayActive reports whether two relays are actively used for this session.
@@ -237,19 +267,20 @@ func (c *Client) selectBestSecondaryRelay(ctx context.Context) (string, time.Dur
 	if len(candidates) == 0 {
 		return "", 0, errors.New("no secondary relay candidates configured or advertised")
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, dualRelayProbeTimeout)
-	defer cancel()
-
 	results := make(chan peerProbeResult, len(candidates))
 	for _, addr := range candidates {
 		go func(candidate string) {
-			rtt, err := tcp.MeasureServerLatencyContext(probeCtx, candidate, dualRelayProbeTimeout)
+			timeout := dualRelayProbeTimeoutFor(candidate)
+			probeCtx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			rtt, err := tcp.MeasureServerLatencyContext(probeCtx, candidate, timeout)
 			results <- peerProbeResult{address: candidate, rtt: rtt, err: err}
 		}(addr)
 	}
 
 	var bestAddr string
 	var bestRTT time.Duration
+	var probeErrors []string
 	for range candidates {
 		res := <-results
 		if res.err == nil {
@@ -259,10 +290,11 @@ func (c *Client) selectBestSecondaryRelay(ctx context.Context) (string, time.Dur
 			}
 		} else {
 			log.Debugf("dual-relay: probe to %s failed: %v", res.address, res.err)
+			probeErrors = append(probeErrors, fmt.Sprintf("%s: %v", res.address, res.err))
 		}
 	}
 	if bestAddr == "" {
-		return "", 0, errors.New("no secondary relay responded to ping probe")
+		return "", 0, fmt.Errorf("no secondary relay responded to ping probe (%s)", strings.Join(probeErrors, "; "))
 	}
 	return bestAddr, bestRTT, nil
 }
@@ -276,10 +308,7 @@ func (c *Client) initiateDualRelayOffer(attempt *transferAttemptState) error {
 		return nil
 	}
 	if !c.dualRelay.peerSupported {
-		log.Infof("dual-relay: receiver does not support %s; using single relay", dualRelayFeature)
-		c.dualRelay.mu.Lock()
-		c.dualRelay.negotiated = true
-		c.dualRelay.mu.Unlock()
+		c.warnDualRelayFallback("receiver does not support %s", dualRelayFeature)
 		return nil
 	}
 
@@ -290,10 +319,7 @@ func (c *Client) initiateDualRelayOffer(attempt *transferAttemptState) error {
 
 	secondaryAddr, rtt, probeErr := c.selectBestSecondaryRelay(c.stop.ctx)
 	if probeErr != nil {
-		log.Infof("dual-relay: %v; falling back to single relay", probeErr)
-		c.dualRelay.mu.Lock()
-		c.dualRelay.negotiated = true
-		c.dualRelay.mu.Unlock()
+		c.warnDualRelayFallback("%v", probeErr)
 		return nil
 	}
 	log.Infof("dual-relay: selected secondary relay %s (RTT %s)", secondaryAddr, rtt)
@@ -308,13 +334,10 @@ func (c *Client) initiateDualRelayOffer(attempt *transferAttemptState) error {
 		secondaryAddr,
 		c.Options.RelayPassword,
 		secondaryRoom,
-		dualRelayConnectTimeout,
+		dualRelayConnectTimeoutFor(secondaryAddr),
 	)
 	if ctrlErr != nil {
-		log.Infof("dual-relay: could not open control room on %s (%v); falling back to single relay", secondaryAddr, ctrlErr)
-		c.dualRelay.mu.Lock()
-		c.dualRelay.negotiated = true
-		c.dualRelay.mu.Unlock()
+		c.warnDualRelayFallback("could not open control room on %s (%v)", secondaryAddr, ctrlErr)
 		return nil
 	}
 
@@ -327,10 +350,7 @@ func (c *Client) initiateDualRelayOffer(attempt *transferAttemptState) error {
 	}
 	if len(cleanPorts) == 0 {
 		ctrlConn.Close()
-		log.Infof("dual-relay: secondary relay %s advertised no data ports; falling back to single relay", secondaryAddr)
-		c.dualRelay.mu.Lock()
-		c.dualRelay.negotiated = true
-		c.dualRelay.mu.Unlock()
+		c.warnDualRelayFallback("secondary relay %s advertised no data ports", secondaryAddr)
 		return nil
 	}
 	if c.Options.NoMultiplexing {
@@ -401,7 +421,7 @@ func (c *Client) openSecondaryRelayDataChannels(attempt *transferAttemptState, r
 				c.Options.RelayPassword,
 				room,
 				capability,
-				dualRelayConnectTimeout,
+				dualRelayConnectTimeoutFor(relayAddr),
 			)
 			results <- openRes{portIdx: j, conn: conn, err: connErr}
 		}(idx, portStr)
@@ -460,7 +480,7 @@ func (c *Client) processMultiRelayOffer(m message.Message, attempt *transferAtte
 		return fmt.Errorf("decode multi-relay offer: %w", err)
 	}
 	sendReject := func(reason string) error {
-		log.Infof("dual-relay: rejecting secondary relay %s (%s); falling back to single relay", offer.Address, reason)
+		log.Warnf("dual-relay: rejecting secondary relay %s (%s); continuing with a single relay", offer.Address, reason)
 		ackBytes, _ := json.Marshal(MultiRelayAck{Accepted: false, Reason: reason})
 		return c.sendControlMessage(message.Message{
 			Type:  message.TypeMultiRelayAck,
@@ -485,7 +505,7 @@ func (c *Client) processMultiRelayOffer(m message.Message, attempt *transferAtte
 			offer.Address,
 			pass,
 			offer.Room,
-			dualRelayConnectTimeout,
+			dualRelayConnectTimeoutFor(offer.Address),
 		)
 		if ctrlErr != nil {
 			return sendReject(ctrlErr.Error())
@@ -571,7 +591,7 @@ func (c *Client) processMultiRelayAck(m message.Message, attempt *transferAttemp
 	}
 
 	if !ack.Accepted {
-		log.Infof("dual-relay: receiver declined secondary relay %s (%s); using single relay", secondaryAddr, ack.Reason)
+		log.Warnf("dual-relay: receiver declined secondary relay %s (%s); continuing with a single relay", secondaryAddr, ack.Reason)
 		cleanupSecondary()
 		return nil
 	}
@@ -580,14 +600,14 @@ func (c *Client) processMultiRelayAck(m message.Message, attempt *transferAttemp
 	if openCh != nil {
 		select {
 		case openErr = <-openCh:
-		case <-time.After(dualRelayConnectTimeout):
+		case <-time.After(dualRelayConnectTimeoutFor(secondaryAddr)):
 			openErr = errors.New("timed out opening sender secondary data channels")
 		case <-c.stop.ctx.Done():
 			openErr = c.stop.ctx.Err()
 		}
 	}
 	if openErr != nil {
-		log.Infof("dual-relay: sender failed to open secondary data channels on %s (%v); using single relay", secondaryAddr, openErr)
+		log.Warnf("dual-relay: sender failed to open secondary data channels on %s (%v); continuing with a single relay", secondaryAddr, openErr)
 		cleanupSecondary()
 		return nil
 	}
@@ -868,7 +888,10 @@ func (c *Client) startDualRelaySenderUnit(attempt *transferAttemptState, file *o
 	if c.dualRelay.active.Load() {
 		relayCount = 2
 	}
-	sched := newReliableChunkScheduler(
+	var sched *reliableChunkScheduler
+	started := time.Now()
+	sentBefore := [2]int64{c.dualRelay.relayChunksSent[0].Load(), c.dualRelay.relayChunksSent[1].Load()}
+	sched = newReliableChunkScheduler(
 		ranges,
 		size,
 		models.TCP_BUFFER_SIZE/2,
@@ -879,6 +902,7 @@ func (c *Client) startDualRelaySenderUnit(attempt *transferAttemptState, file *o
 			if err := file.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
 				log.Errorf("error closing file: %v", err)
 			}
+			c.logDualRelayStats(sched, started, sentBefore)
 		},
 	)
 	for r := 0; r < 2; r++ {
@@ -912,6 +936,29 @@ func (c *Client) startDualRelaySenderUnit(attempt *transferAttemptState, file *o
 		}
 		c.startDualRelaySenderWorker(dc.relayID, dc.conn, file, queue, sched, attempt)
 	}
+}
+
+// logDualRelayStats reports per-relay distribution and estimator state for one
+// finished file (visible with LOGGER=info or --debug).
+func (c *Client) logDualRelayStats(sched *reliableChunkScheduler, started time.Time, sentBefore [2]int64) {
+	if sched == nil {
+		return
+	}
+	st := sched.Stats()
+	elapsed := time.Since(started)
+	log.Infof(
+		"dual-relay stats: policy=%s chunks=%d relayA=%d relayB=%d retransmissions=%d elapsed=%s window=%d/%d minRTT=%s/%s srtt=%s/%s rate=%.1f/%.1fMB/s",
+		c.dualRelay.policy,
+		st.Chunks,
+		c.dualRelay.relayChunksSent[0].Load()-sentBefore[0],
+		c.dualRelay.relayChunksSent[1].Load()-sentBefore[1],
+		st.Retransmissions,
+		elapsed.Round(time.Millisecond),
+		st.Window[0], st.Window[1],
+		st.MinRTT[0].Round(time.Millisecond), st.MinRTT[1].Round(time.Millisecond),
+		st.SRTT[0].Round(time.Millisecond), st.SRTT[1].Round(time.Millisecond),
+		st.RateBps[0]/1e6, st.RateBps[1]/1e6,
+	)
 }
 
 func (c *Client) startDualRelaySenderWorker(relayID int, dataConn *comm.Comm, file *os.File, queue *requestedChunkQueue, sched *reliableChunkScheduler, expectedAttempt *transferAttemptState) {
@@ -981,10 +1028,15 @@ func (c *Client) onReceiverDataConnError(relayID int, err error, attempt *transf
 	if !c.dualRelay.active.Load() {
 		return false
 	}
+	// Only report the relay as failed once its last data connection is gone.
+	// Reporting it on the first closed connection made the sender abandon a
+	// relay whose remaining connections were still healthy.
+	failedRelay := -1
 	if remaining <= 0 {
 		c.dualRelay.relayDead[slot].Store(true)
+		failedRelay = slot
 	}
-	c.sendChunkAckNow(slot)
+	c.sendChunkAckNow(failedRelay)
 	other := 1 - slot
 	otherAlive := !c.dualRelay.relayDead[other].Load() && c.dualRelay.relayWorkerCount[other].Load() > 0
 	if otherAlive || remaining > 0 {
@@ -1064,13 +1116,19 @@ func (c *Client) sendDataReliable(workerID, relayID int, dataConn *comm.Comm, fr
 
 		if err = dataConn.Send(dataToSend); err != nil {
 			sched.RequeueChunk(reqIdx)
+			// Chunks already written to this connection may never arrive.
+			requeued := sched.RequeueConn(relayID, workerID)
 			slot := relayID & 1
 			remaining := c.dualRelay.relayWorkerCount[slot].Add(-1)
-			if c.hasSurvivingRelay(slot) {
-				c.markRelayDead(slot, attempt)
+			if remaining > 0 && c.dualRelay.active.Load() {
+				// Losing one tunnel WebSocket must not disable the whole
+				// relay while its other data connections still work.
+				log.Warnf("dual-relay: data connection on relay %d failed (%v); requeued %d chunks, %d connection(s) remain on that relay", slot, err, requeued+1, remaining)
+				dataConn.Close()
 				return
 			}
-			if remaining > 0 && c.dualRelay.active.Load() {
+			if c.hasSurvivingRelay(slot) {
+				c.markRelayDead(slot, attempt)
 				return
 			}
 			if c.ctxErr() == nil {
