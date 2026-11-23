@@ -20,10 +20,12 @@ const (
 	// seamlessly if either relay fails.
 	ChunkPolicyParity = "parity"
 
-	// maxDynamicInFlightPerRelay caps unacknowledged chunks per relay in
-	// dynamic dual-relay mode (16 chunks = 512 KiB) to prevent kernel TCP
-	// bufferbloat on a slow relay from swallowing megabytes of chunks.
-	maxDynamicInFlightPerRelay = 16
+	// minDynamicInFlightPerRelay caps unacknowledged chunks per relay on low-RTT
+	// LAN links (16 chunks = 512 KiB) to prevent kernel TCP bufferbloat on a slow
+	// relay, while scaling adaptively with observed RTT up to
+	// maxDynamicInFlightPerRelay (256 chunks = 8 MiB) on high-RTT WAN/Cloudflare links.
+	minDynamicInFlightPerRelay = 16
+	maxDynamicInFlightPerRelay = 256
 )
 
 // ParseChunkPolicy validates a chunk scheduling policy name.
@@ -70,6 +72,7 @@ type reliableChunkScheduler struct {
 	progressCounted []bool
 	ackedCount      int
 	lastAckAt       time.Time
+	smoothedRTT     time.Duration
 	relayDead       map[int]bool
 	activeCount     int
 	closed          bool
@@ -159,6 +162,22 @@ func (s *reliableChunkScheduler) aliveRelayCountLocked() int {
 	return alive
 }
 
+func (s *reliableChunkScheduler) dynamicInFlightLimitLocked() int {
+	if s.smoothedRTT <= 25*time.Millisecond {
+		return minDynamicInFlightPerRelay
+	}
+	// Scale window linearly with RTT (~2 chunks per ms) up to 256 chunks (8 MiB)
+	// so high-RTT WAN/Cloudflare tunnels stay saturated without stalling on ACKs.
+	limit := int(s.smoothedRTT/time.Millisecond) * 2
+	if limit < minDynamicInFlightPerRelay {
+		return minDynamicInFlightPerRelay
+	}
+	if limit > maxDynamicInFlightPerRelay {
+		return maxDynamicInFlightPerRelay
+	}
+	return limit
+}
+
 func (s *reliableChunkScheduler) inFlightForRelayLocked(relayID int) int {
 	count := 0
 	for _, entry := range s.inFlight {
@@ -225,10 +244,10 @@ func (s *reliableChunkScheduler) Claim(ctx context.Context, relayID, connID int)
 		}
 
 		// Anti-bufferbloat window: in dynamic dual-relay mode, prevent a slow
-		// relay from hoarding more than maxDynamicInFlightPerRelay unacked
-		// chunks in kernel socket buffers while unclaimed chunks remain.
+		// relay from hoarding unacked chunks in kernel socket buffers while
+		// still scaling with RTT so high-latency WAN links stay saturated.
 		if s.policy == ChunkPolicyDynamic && s.aliveRelayCountLocked() > 1 &&
-			s.inFlightForRelayLocked(relayID) >= maxDynamicInFlightPerRelay {
+			s.inFlightForRelayLocked(relayID) >= s.dynamicInFlightLimitLocked() {
 			s.cond.Wait()
 			continue
 		}
@@ -543,7 +562,17 @@ func (s *reliableChunkScheduler) markAckedLocked(reqIdx int) {
 	if reqIdx < 0 || reqIdx >= s.total {
 		return
 	}
-	delete(s.inFlight, reqIdx)
+	if entry, ok := s.inFlight[reqIdx]; ok {
+		sample := time.Since(entry.sentAt)
+		if sample > 0 && sample < 10*time.Second {
+			if s.smoothedRTT == 0 {
+				s.smoothedRTT = sample
+			} else {
+				s.smoothedRTT = (7*s.smoothedRTT + sample) / 8
+			}
+		}
+		delete(s.inFlight, reqIdx)
+	}
 	if !s.acked[reqIdx] {
 		s.acked[reqIdx] = true
 		s.ackedCount++
