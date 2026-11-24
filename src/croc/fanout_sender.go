@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 	"github.com/schollz/croc/v11/src/comm"
 	"github.com/schollz/croc/v11/src/compress"
 	"github.com/schollz/croc/v11/src/crypt"
+	"github.com/schollz/croc/v11/src/lobby"
 	log "github.com/schollz/croc/v11/src/logger"
 	"github.com/schollz/croc/v11/src/message"
 	"github.com/schollz/croc/v11/src/models"
@@ -225,10 +227,33 @@ func (c *Client) sendFanout(filesInfo []FileInfo, emptyFoldersToTransfer []FileI
 		return err
 	}
 
+	receiverCommand := fmt.Sprintf("croc --relay %s --fanout --out . %s", relayAddr, c.Options.SharedSecret)
+	if runtime.GOOS == "windows" {
+		receiverCommand = fmt.Sprintf(".\\croc.exe --relay %s --fanout --out . %s", relayAddr, c.Options.SharedSecret)
+	}
+
+	var lobbyURL string
+	var lobbyServer *lobby.Server
+	if c.Options.ChatLobby {
+		bindAddress := strings.TrimSpace(c.Options.ChatBind)
+		if bindAddress == "" {
+			bindAddress = "0.0.0.0:0"
+		}
+		var lobbyErr error
+		lobbyServer, lobbyURL, lobbyErr = lobby.Start(bindAddress, c.Options.SharedSecret, receiverCommand)
+		if lobbyErr != nil {
+			return lobbyErr
+		}
+		defer lobbyServer.Close()
+	}
+
 	if !c.Options.Quiet {
 		output, _ := termui.Output(os.Stderr)
-		fmt.Fprintf(output, "Fan-out session ready on %s (waiting up to %s for %d receivers, min %d)\nCode is: %s\nOn receivers run:\n  CROC_SECRET=%q croc --fanout --relay %s\n",
-			relayAddr, waitTimeout, targetReceivers, minReceivers, c.Options.SharedSecret, c.Options.SharedSecret, relayAddr)
+		fmt.Fprintf(output, "Fan-out session ready on %s (waiting up to %s for %d receivers, min %d)\nCode is: %s\nOn receivers run:\n  %s\n",
+			relayAddr, waitTimeout, targetReceivers, minReceivers, c.Options.SharedSecret, receiverCommand)
+		if lobbyURL != "" {
+			fmt.Fprintf(output, "Chat and receive lobby: %s\n", lobbyURL)
+		}
 	}
 
 	muxEvents := make(chan fanoutMuxEvent, 128)
