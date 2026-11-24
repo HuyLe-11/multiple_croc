@@ -96,42 +96,42 @@ func Debug(debug bool) {
 
 // Options specifies user specific options
 type Options struct {
-	IsSender          bool
-	SharedSecret      string
-	RoomName          string
-	Debug             bool
-	RelayAddress      string
-	RelayAddress6     string
-	PublicRelay       bool
-	RelayPorts        []string
-	RelayPassword     string
-	WebOrigin         string `json:"-"`
-	Stdout            bool
-	NoPrompt          bool
-	NoMultiplexing    bool
-	DisableLocal      bool
-	OnlyLocal         bool
-	IgnoreStdin       bool
-	Ask               bool
-	SendingText       bool
-	NoCompress        bool
-	IP                string
-	Overwrite         bool
-	Rename            bool
-	Curve             string
-	HashAlgorithm     string
-	ThrottleUpload    string
-	ZipFolder         bool
-	TestFlag          bool
-	GitIgnore         bool
-	MulticastAddress  string
-	ShowQrCode        bool
-	Exclude           []string
-	ExcludeFile       []string
-	Quiet             bool
-	DisableClipboard  bool
-	ExtendedClipboard bool
-	NoUpdateCheck     bool
+	IsSender                 bool
+	SharedSecret             string
+	RoomName                 string
+	Debug                    bool
+	RelayAddress             string
+	RelayAddress6            string
+	PublicRelay              bool
+	RelayPorts               []string
+	RelayPassword            string
+	WebOrigin                string `json:"-"`
+	Stdout                   bool
+	NoPrompt                 bool
+	NoMultiplexing           bool
+	DisableLocal             bool
+	OnlyLocal                bool
+	IgnoreStdin              bool
+	Ask                      bool
+	SendingText              bool
+	NoCompress               bool
+	IP                       string
+	Overwrite                bool
+	Rename                   bool
+	Curve                    string
+	HashAlgorithm            string
+	ThrottleUpload           string
+	ZipFolder                bool
+	TestFlag                 bool
+	GitIgnore                bool
+	MulticastAddress         string
+	ShowQrCode               bool
+	Exclude                  []string
+	ExcludeFile              []string
+	Quiet                    bool
+	DisableClipboard         bool
+	ExtendedClipboard        bool
+	NoUpdateCheck            bool
 	Transport                TransportMode `json:",omitempty"`
 	DualRelay                bool          `json:",omitempty"`
 	SecondaryRelay           string        `json:",omitempty"`
@@ -145,6 +145,8 @@ type Options struct {
 	FanoutStallTimeout       time.Duration `json:",omitempty"`
 	FanoutStrictRate         bool          `json:",omitempty"`
 	FanoutMode               bool          `json:",omitempty"`
+	ChatLobby                bool          `json:",omitempty"`
+	ChatBind                 string        `json:"-"`
 	OutputDir                string        `json:"-"`
 	SimulatedReceiverRateBps int64         `json:"-"`
 }

@@ -33,6 +33,14 @@ You can use croc without installing anything at [getcroc.com](https://getcroc.co
 
 The browser version is fully compatible with the CLI, so you can send and receive files between them.
 
+### Fan-out web chat lobby
+
+Start a 1-to-N transfer and a local web chat lobby:
+
+```bash
+croc send --receivers 3 --dual-relay --relay2 relay-b.example:9009 --chat --chat-bind 0.0.0.0:8080 file.zip
+```
+
 ## Install
 
 You can download [the latest release for your system](https://github.com/schollz/croc/releases/latest), or install a release from the command-line:
