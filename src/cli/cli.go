@@ -233,7 +233,7 @@ func newApp() *cli.App {
 		&cli.StringFlag{Name: "ip", Value: "", Usage: "set sender ip if known e.g. 10.0.0.1:9009, [::1]:9009"},
 		&cli.StringFlag{Name: "relay", Value: models.DEFAULT_RELAY, Usage: "address of the relay", EnvVars: []string{"CROC_RELAY"}},
 		&cli.StringFlag{Name: "relay6", Value: models.DEFAULT_RELAY6, Usage: "ipv6 address of the relay", EnvVars: []string{"CROC_RELAY6"}},
-		&cli.StringFlag{Name: "out", Value: ".", Usage: "specify an output folder to receive the file"},
+		&cli.StringFlag{Name: "out", Value: ".", Usage: "specify an output folder and skip the interactive folder picker"},
 		&cli.StringFlag{Name: "pass", Value: models.DEFAULT_PASSPHRASE, Usage: "password for the relay", EnvVars: []string{"CROC_PASS"}},
 		&cli.StringFlag{Name: "web-url", Value: "https://getcroc.com", Usage: "web client origin for the receive link and QR code", EnvVars: []string{"CROC_WEB_URL"}},
 		&cli.StringFlag{Name: "socks5", Value: "", Usage: "SOCKS5 proxy address (relay DNS is resolved by the proxy)", EnvVars: []string{"SOCKS5_PROXY"}},
@@ -1154,8 +1154,12 @@ Run croc with no argument and paste the link at the prompt, or use:
 			return fmt.Errorf("could not select public relay: %w", err)
 		}
 	}
-	if c.String("out") != "" {
-		if err = os.Chdir(c.String("out")); err != nil {
+	outputDirectory, err := selectReceiveDirectory(c)
+	if err != nil {
+		return err
+	}
+	if outputDirectory != "" {
+		if err = os.Chdir(outputDirectory); err != nil {
 			return err
 		}
 	}
@@ -1194,6 +1198,20 @@ Run croc with no argument and paste the link at the prompt, or use:
 
 	err = cr.Receive()
 	return
+}
+
+func selectReceiveDirectory(c *cli.Context) (string, error) {
+	if c.IsSet("out") {
+		output := strings.TrimSpace(c.String("out"))
+		if output == "" {
+			output = "."
+		}
+		return output, nil
+	}
+	if c.Bool("yes") || c.Bool("quiet") || c.Bool("stdout") {
+		return ".", nil
+	}
+	return termui.PickDirectory()
 }
 
 func relay(c *cli.Context) (err error) {

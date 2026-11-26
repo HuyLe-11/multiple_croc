@@ -80,7 +80,11 @@ Print the installed release version.
 Automatically accept prompts. Use only when the sender and transfer are trusted.
 .TP
 .B --out DIRECTORY
-Receive files in DIRECTORY.
+Receive files in DIRECTORY and skip the interactive folder picker.
+In an interactive terminal, croc opens a folder tree unless --out, --yes,
+--quiet, or --stdout is specified. Use the arrow keys to navigate, left and
+right to collapse or expand folders, Enter to select, and q to cancel.
+Non-interactive runs receive files in the current directory.
 .TP
 .B --relay ADDRESS
 Use the specified relay.

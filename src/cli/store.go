@@ -365,9 +365,9 @@ func receiveStored(c *cli.Context, value string) error {
 		utils.ByteCountDecimal(total),
 	)
 
-	output := c.String("out")
-	if output == "" {
-		output = "."
+	output, err := selectReceiveDirectory(c)
+	if err != nil {
+		return err
 	}
 	for _, file := range manifest.Files {
 		destination := filepath.Join(output, file.Name)
