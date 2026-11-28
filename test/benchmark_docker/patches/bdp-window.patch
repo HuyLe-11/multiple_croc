@@ -1,0 +1,123 @@
+diff --git a/src/croc/chunk_scheduler.go b/src/croc/chunk_scheduler.go
+index 00c1de95..46670378 100644
+--- a/src/croc/chunk_scheduler.go
++++ b/src/croc/chunk_scheduler.go
+@@ -23,19 +23,19 @@ const (
+ 
+ 	// Dynamic mode bounds the unacknowledged chunks each relay may hold so a
+ 	// slow relay cannot hoard megabytes of chunks in kernel/tunnel buffers at
+-	// the end of a transfer. The bound is computed per relay from that relay's
+-	// own delivery rate and RTT (see updateWindowLocked):
++	// the end of a transfer, and so TCP below does not fill router/tc queues
++	// (which causes packet loss on low-RTT links). The bound is computed per
++	// relay from that relay's own delivery rate and RTT (see updateWindowLocked):
+ 	//
+-	//   window = deliveryRate * max(dynamicDelayBudget, 2*minRTT, sRTT)
++	//   window = deliveryRate * max(2*minRTT, minRTT + primaryMinRTT) + headroom
+ 	//
+-	// The 2*minRTT term keeps the link saturated (2*BDP, as in BBR), the sRTT
+-	// term makes the window neutral (never shrinking) when the ACK loop is
+-	// inflated by queueing on another relay's path, and the delay budget lets a
+-	// relay hold at most ~1 s of data in normal conditions.
+-	minDynamicInFlightPerRelay  = 32   // 1 MiB floor
+-	initDynamicInFlightPerRelay = 256  // 8 MiB until the first estimates exist
++	// i.e. twice the bandwidth-delay product (as in BBR). For the secondary
++	// relay the primary relay's minRTT is included because its ACKs return
++	// over the primary relay's control channel.
++	minDynamicInFlightPerRelay  = 16   // 512 KiB floor (the previous fixed LAN window)
++	initDynamicInFlightPerRelay = 32   // 1 MiB until the first estimates exist
+ 	maxDynamicInFlightPerRelay  = 2048 // 64 MiB ceiling for long fat tunnels
+-	dynamicDelayBudget          = time.Second
++	dynamicWindowHeadroom       = 16   // 512 KiB for ACK batching and jitter
+ 	rateSampleMinInterval       = 100 * time.Millisecond
+ 	rateFilterLen               = 10
+ 	minRTTExpiry                = 10 * time.Second
+@@ -233,8 +233,13 @@ func (s *reliableChunkScheduler) updateWindowLocked(e *relayEstimator) {
+ 		e.window = initDynamicInFlightPerRelay
+ 		return
+ 	}
+-	horizon := max(dynamicDelayBudget, 2*e.minRTT, e.srtt)
+-	window := int(math.Ceil(e.maxRate * horizon.Seconds() / float64(s.chunkSize)))
++	horizon := 2 * e.minRTT
++	// The secondary relay's ACKs return over the primary relay's control
++	// channel, so its loop also includes the primary path's delay.
++	if s.relayIndexLocked(e) == 1 && s.est[0].minRTT > 0 {
++		horizon = max(horizon, e.minRTT+s.est[0].minRTT)
++	}
++	window := int(math.Ceil(e.maxRate*horizon.Seconds()/float64(s.chunkSize))) + dynamicWindowHeadroom
+ 	if e.rateCount < rateFilterLen {
+ 		// Start-up: early samples under-estimate the rate while the pipe fills,
+ 		// so do not shrink below the initial window yet.
+@@ -243,6 +248,14 @@ func (s *reliableChunkScheduler) updateWindowLocked(e *relayEstimator) {
+ 	e.window = min(max(window, minDynamicInFlightPerRelay), maxDynamicInFlightPerRelay)
+ }
+ 
++// relayIndexLocked returns which estimator slot e is.
++func (s *reliableChunkScheduler) relayIndexLocked(e *relayEstimator) int {
++	if e == &s.est[1] {
++		return 1
++	}
++	return 0
++}
++
+ // inFlightForRelayLocked returns the number of unacknowledged chunks currently
+ // assigned to relayID in O(1).
+ func (s *reliableChunkScheduler) inFlightForRelayLocked(relayID int) int {
+diff --git a/src/croc/chunk_scheduler_window_test.go b/src/croc/chunk_scheduler_window_test.go
+index 76ba8e83..3dcb65cb 100644
+--- a/src/croc/chunk_scheduler_window_test.go
++++ b/src/croc/chunk_scheduler_window_test.go
+@@ -23,31 +23,39 @@ func TestDynamicWindowUsesPerRelayEstimates(t *testing.T) {
+ 		assert.Equal(t, initDynamicInFlightPerRelay, sched.dynamicInFlightLimitLocked(r))
+ 	}
+ 
+-	fast := &sched.est[0]
+-	fast.maxRate, fast.minRTT, fast.srtt, fast.rateCount = 5e6, 20*time.Millisecond, 30*time.Millisecond, rateFilterLen
+-	sched.updateWindowLocked(fast)
++	primary := &sched.est[0]
++	primary.maxRate, primary.minRTT, primary.rateCount = 125e6, 5*time.Millisecond, rateFilterLen
++	sched.updateWindowLocked(primary)
++	// LAN relay: 125 MB/s * 2 * 5 ms = 1.25 MB (39 chunks) + 16 headroom.
++	assert.Equal(t, 55, sched.dynamicInFlightLimitLocked(0))
+ 
+ 	tunnel := &sched.est[1]
+-	tunnel.maxRate, tunnel.minRTT, tunnel.srtt, tunnel.rateCount = 15e6, 600*time.Millisecond, 700*time.Millisecond, rateFilterLen
++	tunnel.maxRate, tunnel.minRTT, tunnel.rateCount = 15e6, 600*time.Millisecond, rateFilterLen
+ 	sched.updateWindowLocked(tunnel)
+-
+-	// Fast LAN relay: 5 MB/s * 1 s delay budget.
+-	assert.Equal(t, 153, sched.dynamicInFlightLimitLocked(0))
+ 	// Tunnel relay: 15 MB/s * 2 * 600 ms = 18 MB, far above the old 256-chunk cap.
+-	assert.Equal(t, 550, sched.dynamicInFlightLimitLocked(1))
++	assert.Equal(t, 566, sched.dynamicInFlightLimitLocked(1))
++
++	// The secondary's ACKs travel over the primary: a slower primary path
++	// widens the secondary's horizon to minRTT(B) + minRTT(A).
++	primary.minRTT = 900 * time.Millisecond
++	sched.updateWindowLocked(tunnel)
++	assert.Equal(t, 703, sched.dynamicInFlightLimitLocked(1))
+ 
+-	// A queue-inflated sRTT keeps the window neutral instead of shrinking it.
+-	tunnel.srtt = 3 * time.Second
++	// Start-up never shrinks below the initial window.
++	tunnel.rateCount = 1
++	tunnel.maxRate = 1e3
+ 	sched.updateWindowLocked(tunnel)
+-	assert.Equal(t, 1374, sched.dynamicInFlightLimitLocked(1))
++	assert.Equal(t, initDynamicInFlightPerRelay, sched.dynamicInFlightLimitLocked(1))
+ 
+ 	// Bounds.
++	tunnel.rateCount = rateFilterLen
+ 	tunnel.maxRate = 1e9
+ 	sched.updateWindowLocked(tunnel)
+ 	assert.Equal(t, maxDynamicInFlightPerRelay, sched.dynamicInFlightLimitLocked(1))
+-	fast.maxRate = 1
+-	sched.updateWindowLocked(fast)
+-	assert.Equal(t, minDynamicInFlightPerRelay, sched.dynamicInFlightLimitLocked(0))
++	tunnel.maxRate = 1
++	sched.updateWindowLocked(tunnel)
++	// A near-idle relay keeps only the headroom (plus one rounded-up chunk).
++	assert.Equal(t, dynamicWindowHeadroom+1, sched.dynamicInFlightLimitLocked(1))
+ }
+ 
+ func TestSchedulerInFlightCountersStayConsistent(t *testing.T) {

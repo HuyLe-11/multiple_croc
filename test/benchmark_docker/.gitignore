@@ -1,0 +1,6 @@
+results/
+.worktrees/
+ctx/croc-base
+ctx/croc-fix
+ctx/tc_shape.sh
+__pycache__/
